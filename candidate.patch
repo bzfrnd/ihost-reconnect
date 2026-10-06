@@ -555,6 +555,7 @@ index c64ed5f..8e431cc 100644
  const deviceStore = useDeviceStore();
  const getLoginQrcodeKey = async () => {
 diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
 --- /dev/null
 +++ b/.dockerignore
 @@ -0,0 +1,16 @@
@@ -575,6 +576,7 @@ diff --git a/.dockerignore b/.dockerignore
 +*.zip
 +*.tar*
 diff --git a/Dockerfile.candidate b/Dockerfile.candidate
+new file mode 100644
 --- /dev/null
 +++ b/Dockerfile.candidate
 @@ -0,0 +1,23 @@
@@ -602,6 +604,7 @@ diff --git a/Dockerfile.candidate b/Dockerfile.candidate
 +EXPOSE 8321
 +CMD ["node", "index.js"]
 diff --git a/oauth.env.example b/oauth.env.example
+new file mode 100644
 --- /dev/null
 +++ b/oauth.env.example
 @@ -0,0 +1,7 @@
@@ -613,6 +616,7 @@ diff --git a/oauth.env.example b/oauth.env.example
 +# Alternative: mount credentials as files, then set EWELINK_APP_ID_FILE
 +# and EWELINK_APP_SECRET_FILE instead of the two values above.
 diff --git a/server/config/credentials.ts b/server/config/credentials.ts
+new file mode 100644
 --- /dev/null
 +++ b/server/config/credentials.ts
 @@ -0,0 +1,12 @@
@@ -629,6 +633,7 @@ diff --git a/server/config/credentials.ts b/server/config/credentials.ts
 +};
 +export const redirectUrl = process.env.EWELINK_REDIRECT_URL || '';
 diff --git a/server/oauth/account.ts b/server/oauth/account.ts
+new file mode 100644
 --- /dev/null
 +++ b/server/oauth/account.ts
 @@ -0,0 +1,47 @@
@@ -680,6 +685,7 @@ diff --git a/server/oauth/account.ts b/server/oauth/account.ts
 +        userInfo: { account: 'eWeLink OAuth', autoSyncStatus: false }, user: { apikey: ownApiKey(familyData.familyList, things), accountLevel: 0 } };
 +}
 diff --git a/server/oauth/index.ts b/server/oauth/index.ts
+new file mode 100644
 --- /dev/null
 +++ b/server/oauth/index.ts
 @@ -0,0 +1,21 @@
@@ -705,6 +711,7 @@ diff --git a/server/oauth/index.ts b/server/oauth/index.ts
 +    report: event => logger.info(event),
 +});
 diff --git a/server/oauth/router.ts b/server/oauth/router.ts
+new file mode 100644
 --- /dev/null
 +++ b/server/oauth/router.ts
 @@ -0,0 +1,94 @@
@@ -803,6 +810,7 @@ diff --git a/server/oauth/router.ts b/server/oauth/router.ts
 +    return router;
 +}
 diff --git a/tests/oauth.cjs b/tests/oauth.cjs
+new file mode 100644
 --- /dev/null
 +++ b/tests/oauth.cjs
 @@ -0,0 +1,92 @@
@@ -899,6 +907,7 @@ diff --git a/tests/oauth.cjs b/tests/oauth.cjs
 +    } finally {axios.create=original;if(previous===undefined)delete process.env.EWELINK_REQUIRED_DEVICE_ID;else process.env.EWELINK_REQUIRED_DEVICE_ID=previous;}
 +});
 diff --git a/tests/reconnect.cjs b/tests/reconnect.cjs
+new file mode 100644
 --- /dev/null
 +++ b/tests/reconnect.cjs
 @@ -0,0 +1,77 @@
@@ -980,6 +989,7 @@ diff --git a/tests/reconnect.cjs b/tests/reconnect.cjs
 + await ws.reconnect();assert.equal(attempts,1);
 +});
 diff --git a/tests/token-refresh.cjs b/tests/token-refresh.cjs
+new file mode 100644
 --- /dev/null
 +++ b/tests/token-refresh.cjs
 @@ -0,0 +1,40 @@
