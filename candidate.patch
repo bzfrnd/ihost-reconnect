@@ -1,23 +1,48 @@
 diff --git a/server/config/dev.ts b/server/config/dev.ts
-index cadddaa..6808562 100644
 --- a/server/config/dev.ts
 +++ b/server/config/dev.ts
-@@ -1,4 +1,4 @@
+@@ -1,9 +1,9 @@
 -import { COOLKIT_SECRET } from './secret';
 +import { COOLKIT_SECRET } from './credentials';
  
  export const devConf = {
      nodeApp: {
+         env: 'dev',
+-        port: 8321,
++        port: 8322,
+         dataPath: '',
+         dbPath: '',
+         name: 'ewelink-smart-home',
+@@ -38,5 +38,5 @@
+         refreshEWeLinkTokenGapTime: 24 * 60 * 60,
+     },
+     /** 启动的ip (startup ip)*/
+-    localIp: 'http://10.10.4.168:8321',
++    localIp: 'http://10.10.4.168:8322',
+ };
 diff --git a/server/config/prod.ts b/server/config/prod.ts
-index 48e6460..b1871a1 100644
 --- a/server/config/prod.ts
 +++ b/server/config/prod.ts
-@@ -1,4 +1,4 @@
+@@ -1,10 +1,10 @@
 -import { COOLKIT_SECRET } from './secret';
 +import { COOLKIT_SECRET } from './credentials';
  import os from 'os';
  
  export const prodConf = {
+     nodeApp: {
+         env: 'prod',
+-        port: 8321,
++        port: 8322,
+         dataPath: '',
+         dbPath: '',
+         name: 'ewelink-smart-home',
+@@ -39,5 +39,5 @@
+         refreshEWeLinkTokenGapTime: 24 * 60 * 60,
+     },
+     /** 启动的ip */
+-    localIp: `http://${os.hostname()}:8321`,
++    localIp: `http://${os.hostname()}:8322`,
+ };
 diff --git a/server/index.ts b/server/index.ts
 index e8550a1..1d4d01b 100644
 --- a/server/index.ts
@@ -602,7 +627,7 @@ new file mode 100644
 +COPY --from=build /build/server/dist ./
 +COPY --from=build /build/web/dist ./public
 +COPY version ./version
-+EXPOSE 8321
++EXPOSE 8322
 +CMD ["node", "index.js"]
 diff --git a/oauth.env.example b/oauth.env.example
 new file mode 100644
@@ -612,7 +637,7 @@ new file mode 100644
 +APP_ENV=prod
 +EWELINK_APP_ID=replace-with-your-app-id
 +EWELINK_APP_SECRET=replace-with-your-app-secret
-+EWELINK_REDIRECT_URL=http://192.168.0.230:8321/oauth/callback
++EWELINK_REDIRECT_URL=http://192.168.0.230:8322/oauth/callback
 +EWELINK_REQUIRED_DEVICE_ID=1001fe62ff
 +# Alternative: mount credentials as files, then set EWELINK_APP_ID_FILE
 +# and EWELINK_APP_SECRET_FILE instead of the two values above.
