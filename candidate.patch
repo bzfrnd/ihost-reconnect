@@ -1,424 +1,1036 @@
-name: Build iHost Reconnect
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-
-env:
-  IMAGE_NAME: ihost-reconnect
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-
-      # ============================================================
-      # FETCH OFFICIAL EWELINK iHOST ADD-ON
-      # ============================================================
-
-      - name: Fetch pinned upstream
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git init source
-
-          git -C source remote add origin \
-            https://github.com/eWeLinkCUBE/cc.ewelink.smart.home.addon.git
-
-          git -C source fetch \
-            --depth 1 \
-            origin c66a0151e70363131715cbcec69430f442fb009a
-
-          git -C source checkout --detach FETCH_HEAD
-
-          echo "Upstream checked out successfully."
-
-
-      # ============================================================
-      # APPLY OUR PATCH
-      # ============================================================
-
-      - name: Apply reconnect and OAuth patch
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd source
-
-          git apply --check ../candidate.patch
-          git apply ../candidate.patch
-
-          echo "candidate.patch successfully applied."
-
-
-      # ============================================================
-      # CREATE iHOST-COMPATIBLE DOCKERFILE
-      #
-      # The patch already contains Dockerfile.candidate,
-      # but we deliberately overwrite it here so the complete
-      # iHost build definition lives in this single workflow.
-      # ============================================================
-
-      - name: Create iHost Dockerfile
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > source/Dockerfile.candidate <<'DOCKERFILE'
-          # ========================================================
-          # BUILD STAGE
-          # ========================================================
-
-          FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS build
-
-          WORKDIR /build
-
-          # --------------------------------------------------------
-          # Server
-          # --------------------------------------------------------
-
-          COPY server/package*.json ./server/
-
-          RUN cd server \
-              && npm install \
-                  --ignore-scripts \
-                  --no-audit \
-                  --no-fund \
-              && npm install \
-                  --no-save \
-                  --ignore-scripts \
-                  @types/ws@7
-
-          COPY server ./server
-
-          RUN cd server && npm run build
-
-
-          # --------------------------------------------------------
-          # Web UI
-          # --------------------------------------------------------
-
-          COPY web/package*.json ./web/
-
-          RUN cd web \
-              && npm ci \
-                  --ignore-scripts \
-                  --no-audit \
-                  --no-fund
-
-          COPY web ./web
-          COPY version ./version
-
-          RUN cd web \
-              && VITE_VERSION=$(cat ../version) npm run build-only \
-              && npm run type-check
-
-
-          # ========================================================
-          # RUNTIME STAGE
-          #
-          # Buildx target:
-          # linux/arm/v7
-          #
-          # This is the architecture required by iHost.
-          # ========================================================
-
-          FROM node:22-bookworm-slim
-
-          ENV NODE_ENV=production
-          ENV APP_ENV=prod
-
-          WORKDIR /workspace
-
-
-          # --------------------------------------------------------
-          # Network utilities used by the original add-on
-          # --------------------------------------------------------
-
-          RUN apt-get update \
-              && apt-get install -y \
-                  --no-install-recommends \
-                  iputils-ping \
-                  iproute2 \
-                  net-tools \
-                  ca-certificates \
-              && rm -rf /var/lib/apt/lists/*
-
-
-          # --------------------------------------------------------
-          # Production dependencies
-          # --------------------------------------------------------
-
-          COPY server/package*.json ./
-
-          RUN npm install \
-                  --omit=dev \
-                  --ignore-scripts \
-                  --no-audit \
-                  --no-fund \
-              && npm cache clean --force
-
-
-          # --------------------------------------------------------
-          # Compiled server + frontend
-          # --------------------------------------------------------
-
-          COPY --from=build /build/server/dist ./
-          COPY --from=build /build/web/dist ./public
-
-          COPY version ./version
-
-
-          # --------------------------------------------------------
-          # eWeLink Smart Home add-on port
-          # --------------------------------------------------------
-
-          EXPOSE 8321
-
-
-          # --------------------------------------------------------
-          # Start server
-          # --------------------------------------------------------
-
-          CMD ["node", "index.js"]
-          DOCKERFILE
-
-          echo "Dockerfile.candidate created:"
-          cat source/Dockerfile.candidate
-
-
-      # ============================================================
-      # NODE / TESTS
-      # ============================================================
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-
-      - name: Install test dependencies
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          npm install \
-            --prefix server \
-            --ignore-scripts \
-            --no-audit \
-            --no-fund
-
-          npm install \
-            --prefix server \
-            --no-save \
-            --ignore-scripts \
-            @types/ws@7
-
-
-      - name: Run reconnect and OAuth tests
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          node --test \
-            tests/reconnect.cjs \
-            tests/oauth.cjs \
-            tests/token-refresh.cjs
-
-
-      - name: TypeScript check
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          server/node_modules/.bin/tsc \
-            --noEmit \
-            -p server/tsconfig.json
-
-
-      # ============================================================
-      # ARMv7 EMULATION
-      # ============================================================
-
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm
-
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-
-      # ============================================================
-      # GHCR LOGIN
-      # ============================================================
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-
-      # ============================================================
-      # IMAGE NAME
-      #
-      # Docker/GHCR image names must be lowercase.
-      # ============================================================
-
-      - name: Set image name
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
-
-          echo "IMAGE=ghcr.io/${OWNER}/${IMAGE_NAME}" >> "$GITHUB_ENV"
-
-          echo "Image:"
-          echo "ghcr.io/${OWNER}/${IMAGE_NAME}"
-
-
-      # ============================================================
-      # BUILD + PUSH
-      #
-      # IMPORTANT FOR iHOST:
-      #
-      # platforms:
-      #   linux/arm/v7
-      #
-      # provenance: false
-      # sbom: false
-      #
-      # oci-mediatypes=false
-      #
-      # This avoids additional OCI/attestation manifests that
-      # can confuse older Docker implementations.
-      # ============================================================
-
-      - name: Build and push iHost ARMv7 image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./source
-          file: ./source/Dockerfile.candidate
-
-          platforms: linux/arm/v7
-
-          provenance: false
-          sbom: false
-
-          outputs: type=image,push=true,oci-mediatypes=false
-
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:compat
-            ${{ env.IMAGE }}:${{ github.sha }}
-
-
-      # ============================================================
-      # VERIFY IMAGE
-      # ============================================================
-
-      - name: Verify published image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo
-          echo "================================================"
-          echo "Checking:"
-          echo "${IMAGE}:latest"
-          echo "================================================"
-          echo
-
-          docker buildx imagetools inspect "${IMAGE}:latest"
-
-          echo
-          echo "Checking required iHost architecture..."
-          echo
-
-          INSPECT="$(docker buildx imagetools inspect "${IMAGE}:latest")"
-
-          if echo "$INSPECT" | grep -q "linux/arm/v7"; then
-
-            echo "✅ linux/arm/v7 found"
-
-          else
-
-            echo "❌ ERROR"
-            echo "linux/arm/v7 was not found in the published image."
-            echo
-            echo "iHost will not recognize this image correctly."
-
-            exit 1
-
-          fi
-
-
-      # ============================================================
-      # RAW MANIFEST INFORMATION
-      # ============================================================
-
-      - name: Inspect raw Docker manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo
-          echo "================================================"
-          echo "RAW IMAGE MANIFEST"
-          echo "================================================"
-          echo
-
-          docker buildx imagetools inspect \
-            "${IMAGE}:latest" \
-            --raw
-
-
-      # ============================================================
-      # FINAL RESULT
-      # ============================================================
-
-      - name: Build summary
-        shell: bash
-        run: |
-          echo
-          echo "================================================"
-          echo "       iHost Reconnect image ready"
-          echo "================================================"
-          echo
-          echo "IMAGE:"
-          echo "${IMAGE}:latest"
-          echo
-          echo "ARCHITECTURE:"
-          echo "linux/arm/v7"
-          echo
-          echo "PORT:"
-          echo "8321"
-          echo
-          echo "RECOMMENDED iHOST NETWORK MODE:"
-          echo "host"
-          echo
-          echo "TAGS:"
-          echo "${IMAGE}:latest"
-          echo "${IMAGE}:compat"
-          echo "${IMAGE}:${GITHUB_SHA}"
-          echo
-          echo "================================================"
+diff --git a/server/config/dev.ts b/server/config/dev.ts
+index cadddaa..6808562 100644
+--- a/server/config/dev.ts
++++ b/server/config/dev.ts
+@@ -1,4 +1,4 @@
+-import { COOLKIT_SECRET } from './secret';
++import { COOLKIT_SECRET } from './credentials';
+ 
+ export const devConf = {
+     nodeApp: {
+diff --git a/server/config/prod.ts b/server/config/prod.ts
+index 48e6460..b1871a1 100644
+--- a/server/config/prod.ts
++++ b/server/config/prod.ts
+@@ -1,4 +1,4 @@
+-import { COOLKIT_SECRET } from './secret';
++import { COOLKIT_SECRET } from './credentials';
+ import os from 'os';
+ 
+ export const prodConf = {
+diff --git a/server/index.ts b/server/index.ts
+index e8550a1..1d4d01b 100644
+--- a/server/index.ts
++++ b/server/index.ts
+@@ -14,6 +14,7 @@ import { initCoolkitApi, initCoolkitWs } from './utils/initApi';
+ import getIHostVersionSupport from './services/public/getIHostVersionSupport';
+ import { encode } from 'js-base64';
+ import os from 'os';
++import oauthLogin from './oauth';
+ 
+ const app = express();
+ const port = config.nodeApp.port;
+@@ -40,6 +41,9 @@ if (!fs.existsSync(dbPath)) {
+ // 将body解析为json格式 (Parse body into json format)
+ app.use(express.json());
+ 
++// Handle OAuth before request logging so codes and state never enter logs.
++app.use('/oauth', oauthLogin);
++
+ // 加载静态文件 (Load static files)
+ app.use(express.static(path.join(__dirname, 'public')));
+ 
+diff --git a/server/lib/coolkit-ws/dist/class/WebSocket.d.ts b/server/lib/coolkit-ws/dist/class/WebSocket.d.ts
+index 7c04f0e..cb43c9c 100644
+--- a/server/lib/coolkit-ws/dist/class/WebSocket.d.ts
++++ b/server/lib/coolkit-ws/dist/class/WebSocket.d.ts
+@@ -14,6 +14,7 @@ export default class WebSocketService {
+     static isReconnecting: boolean;
+     private static listenerHook;
+     private static retryCount;
++    private static reconnectCancelled;
+     private static callBackStack;
+     private static initTs;
+     private static maxReconnectTime;
+diff --git a/server/lib/coolkit-ws/dist/class/WebSocket.js b/server/lib/coolkit-ws/dist/class/WebSocket.js
+index 5fb17b9..c988e4e 100644
+--- a/server/lib/coolkit-ws/dist/class/WebSocket.js
++++ b/server/lib/coolkit-ws/dist/class/WebSocket.js
+@@ -84,7 +84,7 @@ class WebSocketService {
+     }
+     reconnect() {
+         return __awaiter(this, void 0, void 0, function* () {
+-            if (WebSocketService.isReconnecting) {
++            if (WebSocketService.isReconnecting || WebSocketService.reconnectCancelled) {
+                 console.log(`CK_WS: already in reconnect state, won't trigger again`);
+                 return;
+             }
+@@ -92,14 +92,20 @@ class WebSocketService {
+             WebSocketService.isReconnecting = true;
+             WebSocketService.ws = null;
+             WebSocketService.hbInterval && clearInterval(WebSocketService.hbInterval);
+-            const { debug = false, retryInterval = 5, maxRetry = 10 } = WebSocketService.connectConfig;
+-            for (; WebSocketService.retryCount < maxRetry;) {
++            const { debug = false, retryInterval = 5, maxRetry = 10, autoReconnect = false } = WebSocketService.connectConfig;
++            for (; !WebSocketService.reconnectCancelled && (WebSocketService.retryCount < maxRetry || autoReconnect);) {
+                 const retryCount = WebSocketService.retryCount + 1;
+                 this.close();
+                 if (!WebSocketService.isOpen && !WebSocketService.initClose) {
+                     console.log(`CK_WS: reconnect for the ${retryCount} times`);
+                     debug && console.log(`CK_WS: the ${retryCount} times reconnection begins in ${Date.now()}`);
+                     const res = yield this._initWs(`${Date.now()}`);
++                    if (WebSocketService.reconnectCancelled) {
++                        this.close(true);
++                        WebSocketService.isOpen = false;
++                        WebSocketService.isReconnecting = false;
++                        return;
++                    }
+                     debug && console.log(`CK_WS: the ${retryCount} times reconnection ends and result being: ${JSON.stringify(res, null, 4)}`);
+                     if (res.error !== 0) {
+                         this._onAllEventCallBack();
+@@ -113,7 +119,7 @@ class WebSocketService {
+                             msg: (res === null || res === void 0 ? void 0 : res.msg) || 'reconnect fail'
+                         });
+                         WebSocketService.retryCount++;
+-                        if (retryCount + 1 > maxRetry) {
++                        if (!autoReconnect && retryCount + 1 > maxRetry) {
+                             console.log(`CK_WS: reach the reconnection limit, stop reconnect loop`);
+                             eventEmitter_1.default.emit(enum_1.EOpenEventType.RECONNECT, {
+                                 error: enum_1.EErrorCode.RECONNECT_COUNT_EXCEEDED,
+@@ -369,10 +375,12 @@ class WebSocketService {
+                 };
+             }
+             WebSocketService.connectConfig.debug && console.log("CK_WS: ws connection begin init");
++            WebSocketService.reconnectCancelled = false;
+             return yield this._initWs(`${Date.now()}`);
+         });
+     }
+     close(userInit = false) {
++        if (userInit) WebSocketService.reconnectCancelled = true;
+         try {
+             WebSocketService.connectConfig.debug && console.log('CK_WS: close function called');
+             eventEmitter_1.default.removeAllListeners();
+@@ -413,6 +421,7 @@ class WebSocketService {
+ WebSocketService.initClose = false;
+ WebSocketService.isReconnecting = false;
+ WebSocketService.retryCount = 0;
++WebSocketService.reconnectCancelled = false;
+ WebSocketService.callBackStack = new Map();
+ WebSocketService.initTs = `${Date.now()}`;
+ WebSocketService.maxReconnectTime = 2 * 60;
+diff --git a/server/lib/coolkit-ws/dist/ts/interfaces.d.ts b/server/lib/coolkit-ws/dist/ts/interfaces.d.ts
+index b44e219..2742a64 100644
+--- a/server/lib/coolkit-ws/dist/ts/interfaces.d.ts
++++ b/server/lib/coolkit-ws/dist/ts/interfaces.d.ts
+@@ -11,6 +11,8 @@ interface IConfigForApp {
+     heartBeatRatio?: number;
+     retryInterval?: number;
+     maxRetry?: number;
++    /** Keep retrying transient disconnections with a capped delay. */
++    autoReconnect?: boolean;
+     maxRetryInterval?: number;
+ }
+ interface IConfigForDevice {
+@@ -25,6 +27,8 @@ interface IConfigForDevice {
+     heartBeatRatio?: number;
+     retryInterval?: number;
+     maxRetry?: number;
++    /** Keep retrying transient disconnections with a capped delay. */
++    autoReconnect?: boolean;
+     maxRetryInterval?: number;
+ }
+ export type IConfig = IConfigForDevice | IConfigForApp;
+diff --git a/server/lib/coolkit-ws/src/class/WebSocket.ts b/server/lib/coolkit-ws/src/class/WebSocket.ts
+index 1664138..29256ee 100644
+--- a/server/lib/coolkit-ws/src/class/WebSocket.ts
++++ b/server/lib/coolkit-ws/src/class/WebSocket.ts
+@@ -17,6 +17,7 @@ export default class WebSocketService {
+     public static isReconnecting = false;
+     private static listenerHook: string;
+     private static retryCount = 0;
++    private static reconnectCancelled = false;
+     private static callBackStack = new Map();
+     private static initTs = `${Date.now()}`;
+     /** 重连允许的最长时间，默认为2小时 */
+@@ -108,7 +109,7 @@ export default class WebSocketService {
+      * @memberof WebSocketService
+      */
+     private async reconnect() {
+-        if (WebSocketService.isReconnecting) {
++        if (WebSocketService.isReconnecting || WebSocketService.reconnectCancelled) {
+             console.log(`CK_WS: already in reconnect state, won't trigger again`);
+             return;
+         }
+@@ -117,10 +118,10 @@ export default class WebSocketService {
+         WebSocketService.isReconnecting = true;
+         WebSocketService.ws = null;
+         WebSocketService.hbInterval && clearInterval(WebSocketService.hbInterval);
+-        const { debug = false, retryInterval = 5, maxRetry = 10 } = WebSocketService.connectConfig;
++        const { debug = false, retryInterval = 5, maxRetry = 10, autoReconnect = false } = WebSocketService.connectConfig;
+ 
+         // 不论成功或失败 每个长连接实例都默认只会重试10次
+-        for (; WebSocketService.retryCount < maxRetry;) {
++        for (; !WebSocketService.reconnectCancelled && (WebSocketService.retryCount < maxRetry || autoReconnect);) {
+             const retryCount = WebSocketService.retryCount + 1;
+             // 每次重连之前都清空监听事件
+             this.close();
+@@ -128,6 +129,12 @@ export default class WebSocketService {
+                 console.log(`CK_WS: reconnect for the ${retryCount} times`);
+                 debug && console.log(`CK_WS: the ${retryCount} times reconnection begins in ${Date.now()}`);
+                 const res = await this._initWs(`${Date.now()}`);
++                if (WebSocketService.reconnectCancelled) {
++                    this.close(true);
++                    WebSocketService.isOpen = false;
++                    WebSocketService.isReconnecting = false;
++                    return;
++                }
+                 debug && console.log(`CK_WS: the ${retryCount} times reconnection ends and result being: ${JSON.stringify(res, null, 4)}`);
+                 if (res.error !== 0) {
+                     // 重新开启所有监听事件
+@@ -142,7 +149,7 @@ export default class WebSocketService {
+                         msg: res?.msg || 'reconnect fail'
+                     })
+                     WebSocketService.retryCount++;
+-                    if (retryCount + 1 > maxRetry) {
++                    if (!autoReconnect && retryCount + 1 > maxRetry) {
+                         console.log(`CK_WS: reach the reconnection limit, stop reconnect loop`);
+                         EE.emit(EOpenEventType.RECONNECT, {
+                             error: EErrorCode.RECONNECT_COUNT_EXCEEDED,
+@@ -525,6 +532,7 @@ export default class WebSocketService {
+             };
+         }
+         WebSocketService.connectConfig.debug && console.log("CK_WS: ws connection begin init")
++        WebSocketService.reconnectCancelled = false;
+         return await this._initWs(`${Date.now()}`);
+     }
+ 
+@@ -535,6 +543,7 @@ export default class WebSocketService {
+      * @memberof WebSocketService
+      */
+     public close(userInit: boolean = false) {
++        if (userInit) WebSocketService.reconnectCancelled = true;
+         try {
+             WebSocketService.connectConfig.debug && console.log('CK_WS: close function called');
+             EE.removeAllListeners();
+diff --git a/server/lib/coolkit-ws/src/ts/interfaces.ts b/server/lib/coolkit-ws/src/ts/interfaces.ts
+index 1b94843..d406c18 100644
+--- a/server/lib/coolkit-ws/src/ts/interfaces.ts
++++ b/server/lib/coolkit-ws/src/ts/interfaces.ts
+@@ -18,6 +18,8 @@ interface IConfigForApp {
+     retryInterval?: number;
+     /** 最大重试次数 */
+     maxRetry?: number;
++    /** Keep retrying transient disconnections with a capped delay. */
++    autoReconnect?: boolean;
+     /** 最大重试总时间，以秒为单位，默认为2小时 */
+     maxRetryInterval?: number;
+ }
+@@ -40,6 +42,8 @@ interface IConfigForDevice {
+     retryInterval?: number;
+     /** 最大重试次数 */
+     maxRetry?: number;
++    /** Keep retrying transient disconnections with a capped delay. */
++    autoReconnect?: boolean;
+     /** 最大重试总时间，毫秒为单位，默认为2小时 */
+     maxRetryInterval?: number;
+ }
+diff --git a/server/services/login.ts b/server/services/login.ts
+index c32a09f..8963971 100644
+--- a/server/services/login.ts
++++ b/server/services/login.ts
+@@ -7,6 +7,9 @@ import getEwelinkAllDeviceList from './public/getEwelinkAllDeviceList';
+ import { initCoolkitApi } from '../utils/initApi';
+ 
+ export default async function login(req: Request, res: Response) {
++    if (process.env.EWELINK_REDIRECT_URL) {
++        return res.status(400).json(toResponse(400, 'Use OAuth login for this app'));
++    }
+     const { account } = req.params;
+     const { countryCode, password } = req.body;
+     const loginParams = {
+diff --git a/server/services/public/getEwelinkAllDeviceList.ts b/server/services/public/getEwelinkAllDeviceList.ts
+index 5832ec9..15001be 100644
+--- a/server/services/public/getEwelinkAllDeviceList.ts
++++ b/server/services/public/getEwelinkAllDeviceList.ts
+@@ -33,7 +33,7 @@ export default async function getEwelinkAllDeviceList() {
+             return null;
+         }
+ 
+-        const originFamilyList = res.data.familyList.filter((item) => [1, 2].includes(item.familyType)); //自己的设备和别人分享的设备(Your own devices and devices shared by others)
++        const originFamilyList = res.data.familyList.filter((item) => [1, 2].includes(item.familyType) || (eWeLinkApiInfo.authMode === 'oauth' && item.familyType === undefined)); //自己的设备和别人分享的设备(Your own devices and devices shared by others)
+         const familyList = originFamilyList.map((item) => {
+             return {
+                 familyId: item.id,
+diff --git a/server/services/public/refreshEWeLinkToken.ts b/server/services/public/refreshEWeLinkToken.ts
+index 4e03745..f40c689 100644
+--- a/server/services/public/refreshEWeLinkToken.ts
++++ b/server/services/public/refreshEWeLinkToken.ts
+@@ -1,53 +1,43 @@
+-import _ from 'lodash';
+-import CkApi from '../../lib/coolkit-api';
+-import logger from '../../log';
+-import db from '../../utils/db';
+-import toLogout from '../../utils/toLogout';
+-
+-function atExpired() {
+-    const AT_LIFETIME = 86400000 * 15; // 15 day
+-
+-    const atUpdateTime = db.getDbValue('atUpdateTime');
+-    // 未登录，不作刷新at操作 (Not logged in, no refresh at operation)
+-    if (atUpdateTime === 0) {
+-        return false;
+-    }
+-    return Date.now() > atUpdateTime + AT_LIFETIME;
+-}
+-
+-/**
+- * 刷新at
+- * Refresh at
+- * @export
+- * @param {Request} req
+- * @param {Response} res
+- * @param {NextFunction} next
+- * @return {*}
+- */
+-export default async function refreshEWeLinkToken() {
+-    if (!atExpired()) {
+-        return;
+-    }
+-    logger.info('retry refresh at request --------------------------------------');
+-    const refreshRes = await CkApi.user.refresh();
+-    logger.info('retry refresh at res ----------------------------------', refreshRes);
+-    if (refreshRes.error !== 0) {
+-        toLogout()
+-        return;
+-    }
+-    const { at, rt } = refreshRes.data;
+-
+-    db.setDbValue('atUpdateTime', Date.now());
+-    logger.info('atUpdateTime----------------', db.getDbValue('atUpdateTime'));
+-    const eWeLinkApiInfo = db.getDbValue('eWeLinkApiInfo');
+-    if (!eWeLinkApiInfo) {
+-        return;
+-    }
+-    eWeLinkApiInfo.at = at;
+-    eWeLinkApiInfo.rt = rt;
+-
+-    db.setDbValue('eWeLinkApiInfo', eWeLinkApiInfo);
+-    logger.info('eWeLinkApiInfo----------------------', db.getDbValue('eWeLinkApiInfo'));
+-
+-    return;
+-}
++import axios from 'axios';
++import config from '../../config';
++import logger from '../../log';
++import db from '../../utils/db';
++import { apiOrigin } from '../../oauth/router';
++import { initCoolkitApi } from '../../utils/initApi';
++import WebSocketService from '../../lib/coolkit-ws/dist/class/WebSocket';
++
++let refreshing = false;
++export default async function refreshEWeLinkToken() {
++    const account = db.getDbValue('eWeLinkApiInfo');
++    const updated = db.getDbValue('atUpdateTime');
++    if (!account || !updated || refreshing) return;
++    const expiry = account.atExpiredTime || updated + 30 * 86400000;
++    if (Date.now() < Math.min(expiry - 86400000, updated + 15 * 86400000)) return;
++    const previousToken = account.at;
++    refreshing = true;
++    try {
++        const response = await axios.post(`${apiOrigin(account.region)}/v2/user/refresh`, { rt: account.rt }, {
++            timeout: 10000, maxRedirects: 0,
++            headers: { 'X-CK-Appid': config.coolKit.appId, Authorization: `Bearer ${previousToken}` },
++        });
++        const { error, data } = response.data;
++        if (error !== 0 || typeof data?.at !== 'string' || !data.at || typeof data?.rt !== 'string' || !data.rt) {
++            logger.warn('Token refresh rejected; session retained for retry. Reauthorise if this persists.');
++            return;
++        }
++        // A response from an old session must never restore a logged-out account.
++        const current = db.getDbValue('eWeLinkApiInfo');
++        if (!current || current.at !== previousToken || current.user.apikey !== account.user.apikey) return;
++        db.setDbValue('eWeLinkApiInfo', { ...current, at: data.at, rt: data.rt, atExpiredTime: Date.now() + 30 * 86400000 });
++        db.setDbValue('atUpdateTime', Date.now());
++        initCoolkitApi();
++        // Keep the established socket; future handshakes use the fresh token.
++        if (WebSocketService.connectConfig?.apikey === current.user.apikey && 'at' in WebSocketService.connectConfig) WebSocketService.connectConfig.at = data.at;
++        logger.info('eWeLink token refreshed');
++    } catch (_) {
++        // Network outages must not log the user out or write credentials to logs.
++        logger.warn('eWeLink token refresh unavailable; retry scheduled');
++    } finally {
++        refreshing = false;
++    }
++}
+diff --git a/server/ts/interface/IEWeLinkApiInfo.ts b/server/ts/interface/IEWeLinkApiInfo.ts
+index 3b57dc8..0b01d7a 100644
+--- a/server/ts/interface/IEWeLinkApiInfo.ts
++++ b/server/ts/interface/IEWeLinkApiInfo.ts
+@@ -1,4 +1,6 @@
+ export default interface IEWeLinkApiInfo {
++    authMode?: 'oauth';
++    atExpiredTime?: number;
+     at: string;
+     rt: string;
+     region: 'cn' | 'us' | 'eu' | 'as';
+diff --git a/server/ts/interface/IWSConfig.ts b/server/ts/interface/IWSConfig.ts
+index 422bbbd..bf16a67 100644
+--- a/server/ts/interface/IWSConfig.ts
++++ b/server/ts/interface/IWSConfig.ts
+@@ -10,6 +10,8 @@ export default interface IWSConfig {
+     heartBeatRatio?: number;
+     retryInterval?: number;
+     maxRetry?: number;
++    /** Keep retrying transient disconnections with a capped delay. */
++    autoReconnect?: boolean;
+     /** 最大重试总时间，以秒为单位，默认为2小时 */
+     maxRetryInterval?: number;
+ }
+diff --git a/server/utils/db/index.ts b/server/utils/db/index.ts
+index 783c701..cedf01e 100644
+--- a/server/utils/db/index.ts
++++ b/server/utils/db/index.ts
+@@ -102,7 +102,7 @@ function setDbValue(key: DbKey, v: IDbData[DbKey]) {
+         writeFileToQueue(encode(JSON.stringify(data)), id);
+     } catch (error) {
+         const data = getDb();
+-        logger.error('set db file---------------', 'error-----', error, data);
++        logger.error('set db file failed');
+     }
+ }
+ 
+diff --git a/server/utils/gapTimeRun.ts b/server/utils/gapTimeRun.ts
+index e367d9b..d9dee39 100644
+--- a/server/utils/gapTimeRun.ts
++++ b/server/utils/gapTimeRun.ts
+@@ -55,5 +55,5 @@ export default function gapTimeRun() {
+     setInterval(() => {
+         logger.info('check at --------------refresh');
+         refreshEWeLinkToken();
+-    }, refreshEWeLinkTokenGapTime * 1000);
++    }, Math.min(refreshEWeLinkTokenGapTime, 15 * 60) * 1000);
+ }
+diff --git a/server/utils/initApi.ts b/server/utils/initApi.ts
+index ae8c3d9..3e65e2c 100644
+--- a/server/utils/initApi.ts
++++ b/server/utils/initApi.ts
+@@ -54,18 +54,19 @@ export const initCoolkitWs = async () => {
+         const { region, at, user } = eWeLinkApiInfo;
+ 
+         const wsConfig: IWSConfig = {
+-            userAgent: 'pc_ewelink',
++            userAgent: eWeLinkApiInfo.authMode === 'oauth' ? 'app' : 'pc_ewelink',
+             appid: config.coolKit.appId,
+             at,
+             apikey: user.apikey,
+             region,
+             maxRetry: 99,
++            autoReconnect: true,
+             /**
+              * 最大重试总时间，以秒为单位，默认为2小时，传入10分钟
+              * Maximum total retry time, in seconds, defaults to 2 hours, enter 10 minutes
+              */
+             maxRetryInterval: 10 * 60,
+-            debug: true,
++            debug: false,
+         };
+         logger.info('ws--------------start');
+ 
+@@ -73,7 +74,7 @@ export const initCoolkitWs = async () => {
+         const res = await CoolKitWs.init(wsConfig);
+         logger.info('ws res-------------------', res);
+ 
+-        if (res.error === 605) {
++        if ([602, 604, 605].includes(res.error)) {
+             logger.info('wsRC --------------------start reconnect');
+             WsReconnect.startReconnect(wsConfig);
+         }
+diff --git a/server/utils/toLogout.ts b/server/utils/toLogout.ts
+index 2256606..ae1c12e 100644
+--- a/server/utils/toLogout.ts
++++ b/server/utils/toLogout.ts
+@@ -2,6 +2,7 @@ import db from '../utils/db';
+ import logger from '../log';
+ import syncAllWebSocketDeviceOffline from '../services/webSocket/syncAllWebSocketDeviceOffline'
+ import CoolKitWs from '../lib/coolkit-ws';
++import WsReconnect from './wsReconnectClass';
+ 
+ function toLogout() {
+     try {
+@@ -9,6 +10,7 @@ function toLogout() {
+ 
+         //clear data
+         db.setDbValue('eWeLinkApiInfo', null);
++        WsReconnect.stopReconnect();
+         db.setDbValue('autoSyncStatus', false);
+         db.setDbValue('atUpdateTime', 0);
+         db.setDbValue('eWeLinkDeviceList', []);
+diff --git a/server/utils/wsReconnectClass.ts b/server/utils/wsReconnectClass.ts
+index 22aa560..ec2908c 100644
+--- a/server/utils/wsReconnectClass.ts
++++ b/server/utils/wsReconnectClass.ts
+@@ -25,12 +25,14 @@ class WsReconnectClass {
+     }
+ 
+     reconnectSuccess() {
++        this.reconnectTimeout = 5000;
+         getEwelinkAllDeviceList();
+         CoolKitWs.on('message', (ev) => wsService.listenWs(ev));
+         CoolKitWs.on('reconnect', (data) => {
+             logger.info('reconnect----------------wsReconnect', data);
+             if (data.error == 0) {
+-                getEwelinkAllDeviceList();
++                this.reconnectTimeout = 5000;
++        getEwelinkAllDeviceList();
+                 return;
+             }
+             //重连超过5次失败，离线所有websocket设备
+@@ -43,7 +45,7 @@ class WsReconnectClass {
+     }
+ 
+     startReconnect(wsConfig: IWSConfig) {
+-        logger.info('wsConfig-------------------------',wsConfig)
++        // Do not log credentials contained in wsConfig.
+         if (!this.isNeedReconnect()) {
+             return;
+         }
+@@ -52,14 +54,25 @@ class WsReconnectClass {
+         this.reconnectTimer = setTimeout(async () => {
+             this.reconnectTimer = null;
+ 
+-            const res = await CoolKitWs.init(wsConfig);
++            const current = db.getDbValue('eWeLinkApiInfo');
++            // A pending timer must not reconnect a logged-out or different account.
++            if (!current?.user || current.user.apikey !== wsConfig.apikey) return;
++            if (CoolKitWs.isWsConnected()) return;
++            let res;
++            try {
++                res = await CoolKitWs.init({ ...wsConfig, at: current.at });
++            } catch (error) {
++                logger.warn('wsRC --------------------initialization failed; retry scheduled');
++                this.startReconnect(wsConfig);
++                return;
++            }
+             if (res.error === 0 && res.msg === 'success') {
+                 logger.info('wsRC --------------------reconnect success', res.error);
+                 this.stopReconnect();
+                 this.reconnectSuccess();
+             }
+-            if (res.error === 605) {
+-                logger.info('wsRC --------------------reconnect fail, no internet');
++            if ([602, 604, 605].includes(res.error)) {
++                logger.info('wsRC --------------------transient connection failure; retry scheduled');
+                 this.startReconnect(wsConfig);
+             }
+         }, this.reconnectTimeout);
+diff --git a/web/src/views/Home/components/LoginModal.vue b/web/src/views/Home/components/LoginModal.vue
+index c64ed5f..8e431cc 100644
+--- a/web/src/views/Home/components/LoginModal.vue
++++ b/web/src/views/Home/components/LoginModal.vue
+@@ -30,7 +30,13 @@
+                     </a-tab-pane>
+                     <a-tab-pane key="2" :tab="$t('LOGIN_WITH_PASSWORD')"> -->
+                 <!-- <div v-if="activeKey === '2'"> -->
+-                <div>
++                <div v-if="oauthEnabled">
++                    <div class="title">eWeLink OAuth</div>
++                    <p>Jelentkezz be az eWeLink hivatalos oldalán.</p>
++                    <a href="/oauth" target="_blank" rel="noopener noreferrer">Belépés az eWeLink-fiókkal</a>
++                    <p>Belépés után frissítsd ezt az oldalt.</p>
++                </div>
++                <div v-else>
+                     <div class="title">{{ $t('LOGIN_WITH_PASSWORD') }}</div>
+                     <a-form class="form" :label-col="etcStore.language === 'zh-cn' ? labelColCN : labelColEN" :model="accountInfo">
+                         <span>{{ $t('REGION') }}</span>
+@@ -96,7 +102,10 @@ interface IAccountInfoType {
+ }
+ 
+ const spinning = ref<boolean>(false);
+-onMounted(() => {});
++const oauthEnabled = ref(false);
++onMounted(async () => {
++    try { oauthEnabled.value = (await (await fetch('/oauth/status')).json()).enabled === true; } catch (_) {}
++});
+ const etcStore = useEtcStore();
+ const deviceStore = useDeviceStore();
+ const getLoginQrcodeKey = async () => {
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,17 @@
++.git
++**/node_modules
++server/dist
++web/dist
++**/.env
++**/.env.*
++!**/.env.example
++server/config/secret.ts
++**/data
++**/logFile
++**/*.log
++tests
++outputs
++node-app
++deploy
++*.zip
++*.tar*
+diff --git a/Dockerfile.candidate b/Dockerfile.candidate
+new file mode 100644
+--- /dev/null
++++ b/Dockerfile.candidate
+@@ -0,0 +1,23 @@
++FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS build
++WORKDIR /build
++COPY server/package*.json ./server/
++RUN cd server && npm install --ignore-scripts --no-audit --no-fund && npm install --no-save --ignore-scripts @types/ws@7
++COPY server ./server
++RUN cd server && npm run build
++COPY web/package*.json ./web/
++RUN cd web && npm ci --ignore-scripts --no-audit --no-fund
++COPY web ./web
++COPY version ./version
++RUN cd web && VITE_VERSION=$(cat ../version) npm run build-only && npm run type-check
++
++FROM node:22-bookworm-slim
++ENV NODE_ENV=production APP_ENV=prod
++WORKDIR /workspace
++RUN apt-get update && apt-get install -y --no-install-recommends iputils-ping iproute2 net-tools && rm -rf /var/lib/apt/lists/*
++COPY server/package*.json ./
++RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
++COPY --from=build /build/server/dist ./
++COPY --from=build /build/web/dist ./public
++COPY version ./version
++EXPOSE 8321
++CMD ["node", "index.js"]
+diff --git a/oauth.env.example b/oauth.env.example
+new file mode 100644
+--- /dev/null
++++ b/oauth.env.example
+@@ -0,0 +1,7 @@
++APP_ENV=prod
++EWELINK_APP_ID=replace-with-your-app-id
++EWELINK_APP_SECRET=replace-with-your-app-secret
++EWELINK_REDIRECT_URL=http://192.168.0.230:8321/oauth/callback
++EWELINK_REQUIRED_DEVICE_ID=1001fe62ff
++# Alternative: mount credentials as files, then set EWELINK_APP_ID_FILE
++# and EWELINK_APP_SECRET_FILE instead of the two values above.
+diff --git a/server/config/credentials.ts b/server/config/credentials.ts
+new file mode 100644
+--- /dev/null
++++ b/server/config/credentials.ts
+@@ -0,0 +1,12 @@
++import fs from 'fs';
++
++// Supply credentials at container runtime, never in the image or source archive.
++function value(name: string): string {
++    const file = process.env[`${name}_FILE`];
++    return (file ? fs.readFileSync(file, 'utf8') : process.env[name] || '').trim();
++}
++export const COOLKIT_SECRET = {
++    appId: value('EWELINK_APP_ID'),
++    appSecret: value('EWELINK_APP_SECRET'),
++};
++export const redirectUrl = process.env.EWELINK_REDIRECT_URL || '';
+diff --git a/server/oauth/account.ts b/server/oauth/account.ts
+new file mode 100644
+--- /dev/null
++++ b/server/oauth/account.ts
+@@ -0,0 +1,47 @@
++import axios from 'axios';
++import { apiOrigin, sign } from './router';
++import type IEWeLinkApiInfo from '../ts/interface/IEWeLinkApiInfo';
++
++export function ownApiKey(families: any[], things: any[]): string {
++    // Shared devices/families belong to another account; never use their key.
++    const keys = new Set<string>();
++    for (const family of families) if (family.familyType === 1 && typeof family.apikey === 'string' && family.apikey) keys.add(family.apikey);
++    for (const thing of things) if (thing.itemType === 1 && typeof thing.itemData?.apikey === 'string' && thing.itemData.apikey) keys.add(thing.itemData.apikey);
++    if (keys.size !== 1) throw new Error('Cannot identify account owner');
++    return [...keys][0];
++}
++export async function exchangeAccount(appId: string, secret: string, redirectUrl: string, code: string, region: string): Promise<IEWeLinkApiInfo> {
++    const http = axios.create({ baseURL: apiOrigin(region), timeout: 10000, maxRedirects: 0, maxContentLength: 5 * 1024 * 1024 });
++    const body = JSON.stringify({ code, redirectUrl, grantType: 'authorization_code' });
++    const token = (await http.post('/v2/user/oauth/token', body, { headers: { 'Content-Type': 'application/json', 'X-CK-Appid': appId, Authorization: `Sign ${sign(secret, body)}` } })).data;
++    const data = token?.data;
++    if (token.error !== 0 || typeof data?.accessToken !== 'string' || !data.accessToken || typeof data?.refreshToken !== 'string' || !data.refreshToken || !Number.isFinite(data.atExpiredTime) || data.atExpiredTime <= Date.now()) throw new Error('Invalid token response');
++    const headers = { 'X-CK-Appid': appId, Authorization: `Bearer ${data.accessToken}` };
++    const get = async (path: string, params = {}) => {
++        await new Promise(resolve => setTimeout(resolve, 1000));
++        const response = (await http.get(path, { headers, params })).data;
++        if (response.error !== 0) throw new Error('Account access denied');
++        return response.data;
++    };
++    const familyData = await get('/v2/family');
++    if (!Array.isArray(familyData?.familyList)) throw new Error('Invalid family list');
++    const things: any[] = [];
++    for (const family of familyData.familyList) {
++        let beginIndex = -9999999;
++        for (let page = 0; ; page++) {
++            if (page >= 100) throw new Error('Device list exceeds supported size');
++            const response = await get('/v2/device/thing', { familyid: family.id, num: 30, beginIndex });
++            if (!Array.isArray(response?.thingList)) throw new Error('Invalid device list');
++            const batch = response.thingList;
++            things.push(...batch);
++            if (batch.length < 30) break;
++            const lastIndex = batch[batch.length - 1].index;
++            if (!Number.isFinite(lastIndex) || lastIndex <= beginIndex) throw new Error('Invalid device pagination');
++            beginIndex = lastIndex + 1;
++        }
++    }
++    const required = process.env.EWELINK_REQUIRED_DEVICE_ID;
++    if (required && !things.some(t => [1, 2].includes(t.itemType) && t.itemData?.deviceid === required)) throw new Error('Required device is not authorised');
++    return { at: data.accessToken, rt: data.refreshToken, region: region as IEWeLinkApiInfo['region'], authMode: 'oauth', atExpiredTime: data.atExpiredTime,
++        userInfo: { account: 'eWeLink OAuth', autoSyncStatus: false }, user: { apikey: ownApiKey(familyData.familyList, things), accountLevel: 0 } };
++}
+diff --git a/server/oauth/index.ts b/server/oauth/index.ts
+new file mode 100644
+--- /dev/null
++++ b/server/oauth/index.ts
+@@ -0,0 +1,21 @@
++import { createOAuthRouter } from './router';
++import { exchangeAccount } from './account';
++import { COOLKIT_SECRET, redirectUrl } from '../config/credentials';
++import db from '../utils/db';
++import logger from '../log';
++import { initCoolkitApi } from '../utils/initApi';
++import getEwelinkAllDeviceList from '../services/public/getEwelinkAllDeviceList';
++
++export default createOAuthRouter({
++    ...COOLKIT_SECRET, redirectUrl,
++    loggedIn: () => !!db.getDbValue('eWeLinkApiInfo'),
++    exchange: (code, region) => exchangeAccount(COOLKIT_SECRET.appId, COOLKIT_SECRET.appSecret, redirectUrl, code, region),
++    save: account => {
++        account.userInfo.autoSyncStatus = db.getDbValue('autoSyncStatus');
++        db.setDbValue('eWeLinkApiInfo', account);
++        db.setDbValue('atUpdateTime', Date.now());
++        initCoolkitApi();
++    },
++    afterLogin: getEwelinkAllDeviceList,
++    report: event => logger.info(event),
++});
+diff --git a/server/oauth/router.ts b/server/oauth/router.ts
+new file mode 100644
+--- /dev/null
++++ b/server/oauth/router.ts
+@@ -0,0 +1,94 @@
++import express, { Request } from 'express';
++import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
++
++export interface OAuthOptions {
++    appId: string;
++    appSecret: string;
++    redirectUrl: string;
++    loggedIn: () => boolean;
++    exchange: (code: string, region: string) => Promise<unknown>;
++    save: (account: any) => void;
++    afterLogin: () => Promise<unknown>;
++    report: (event: string) => void;
++}
++export function sign(secret: string, value: string) {
++    return createHmac('sha256', secret).update(value).digest('base64');
++}
++export function apiOrigin(region: string) {
++    if (!['eu', 'us', 'as', 'cn'].includes(region)) throw new Error('Invalid region');
++    return `https://${region}-apia.coolkit.${region === 'cn' ? 'cn' : 'cc'}`;
++}
++function equal(a: unknown, b: string): boolean {
++    return typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
++}
++function cookie(req: Request) {
++    return (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('ewelink_oauth='))?.slice(14) || '';
++}
++export function createOAuthRouter(options: OAuthOptions) {
++    const router = express.Router();
++    const pending = new Map<string, { expires: number; state: string; started: boolean }>();
++    let callback: URL | undefined;
++    try {
++        const url = new URL(options.redirectUrl);
++        if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/oauth/callback') callback = url;
++    } catch (_) { /* Remain disabled until configured. */ }
++    const enabled = !!(callback && options.appId && options.appSecret);
++    const cookieOptions = { httpOnly: true, sameSite: 'lax' as const, secure: callback?.protocol === 'https:', path: '/oauth' };
++    const page = (body: string) => `<!doctype html><html lang="hu"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>iHost – eWeLink</title><body><h1>eWeLink-belépés</h1>${body}</body></html>`;
++    router.use((_req, res, next) => {
++        res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
++        next();
++    });
++    router.get('/status', (_req, res) => { res.json({ enabled }); });
++    router.use((req, res, next) => {
++        if (!enabled) return res.status(503).send(page('<p>Az App ID, App Secret és Redirect URL még nincs beállítva a konténerben.</p>'));
++        // Only the explicitly configured address may receive the browser session.
++        if (req.get('host') !== callback!.host) return res.redirect(303, `${callback!.origin}/oauth`);
++        next();
++    });
++    router.get('/', (req, res) => {
++        if (options.loggedIn()) return res.status(409).send(page('<p>Már be vagy jelentkezve. Fiókváltás előtt jelentkezz ki a kiegészítőben.</p>'));
++        for (const [id, session] of pending) if (session.expires <= Date.now()) pending.delete(id);
++        if (pending.size >= 100) return res.status(429).send(page('<p>Túl sok belépési kísérlet. Próbáld újra később.</p>'));
++        pending.delete(cookie(req));
++        const id = randomBytes(32).toString('hex');
++        const state = randomBytes(32).toString('hex');
++        pending.set(id, { state, started: false, expires: Date.now() + 10 * 60 * 1000 });
++        res.cookie('ewelink_oauth', id, { ...cookieOptions, maxAge: 10 * 60 * 1000 });
++        res.send(page(`<p>A folytatás az eWeLink hivatalos bejelentkezési oldalára visz.</p><form method="post" action="/oauth/start"><input type="hidden" name="state" value="${state}"><button type="submit">Folytatás az eWeLink oldalán</button></form>`));
++    });
++    router.post('/start', express.urlencoded({ extended: false, limit: '2kb' }), (req, res) => {
++        const session = pending.get(cookie(req));
++        if (req.get('origin') !== callback!.origin || !session || session.started || session.expires <= Date.now() || !equal(req.body.state, session.state)) {
++            return res.status(400).send(page('<p>Érvénytelen belépési kísérlet. Nyisd meg újra a belépési oldalt.</p>'));
++        }
++        session.started = true;
++        const seq = String(Date.now());
++        const url = new URL('https://c2ccdn.coolkit.cc/oauth/index.html');
++        url.search = new URLSearchParams({ clientId: options.appId, seq, authorization: sign(options.appSecret, `${options.appId}_${seq}`), redirectUrl: options.redirectUrl, grantType: 'authorization_code', state: session.state, nonce: randomBytes(4).toString('hex') }).toString();
++        res.redirect(303, url.toString());
++    });
++    router.get('/callback', async (req, res) => {
++        const id = cookie(req);
++        const session = pending.get(id);
++        if (!session || !session.started || session.expires <= Date.now() || !equal(req.query.state, session.state) || typeof req.query.code !== 'string' || req.query.code.length > 1024 || !req.query.code || typeof req.query.region !== 'string' || !['eu', 'as', 'us', 'cn'].includes(req.query.region)) {
++            return res.status(400).send(page('<p>Érvénytelen vagy lejárt belépés. <a href="/oauth">Újrapróbálás</a></p>'));
++        }
++        pending.delete(id); // Consume before any network request: callback cannot be replayed.
++        res.clearCookie('ewelink_oauth', cookieOptions);
++        if (options.loggedIn()) return res.status(409).send(page('<p>Már be vagy jelentkezve.</p>'));
++        try {
++            const account = await options.exchange(req.query.code, req.query.region);
++            if (options.loggedIn()) return res.status(409).send(page('<p>Közben már megtörtént a belépés.</p>'));
++            options.save(account);
++            options.report('OAuth login succeeded');
++            // Do not hold the callback open for device synchronisation.
++            void options.afterLogin().catch(() => options.report('OAuth device synchronisation failed; retry from the add-on'));
++            return res.redirect(303, '/#/home');
++        } catch (_) {
++            options.report('OAuth login failed (exchange or account validation)');
++            return res.status(502).send(page('<p>A belépést vagy az eszközhozzáférést nem sikerült ellenőrizni. Ellenőrizd az app beállításait és jogosultságait. <a href="/oauth">Újrapróbálás</a></p>'));
++        }
++    });
++    return router;
++}
+diff --git a/tests/oauth.cjs b/tests/oauth.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/oauth.cjs
+@@ -0,0 +1,92 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++process.env.TS_NODE_PROJECT = require('node:path').join(__dirname, '../server/tsconfig.json');
++require('../server/node_modules/ts-node/register/transpile-only');
++const express = require('../server/node_modules/express');
++const { createOAuthRouter, sign, apiOrigin } = require('../server/oauth/router.ts');
++const { ownApiKey } = require('../server/oauth/account.ts');
++
++test('official HMAC vector and region allowlist', () => {
++    assert.equal(sign('abc', 'ABC_123'), 'v1+mfNY2ukxswM8sZOTg99srZsVnUVv9DGXeav1096M=');
++    assert.equal(apiOrigin('eu'), 'https://eu-apia.coolkit.cc');
++    assert.equal(apiOrigin('cn'), 'https://cn-apia.coolkit.cn');
++    assert.throws(() => apiOrigin('evil.example'));
++});
++test('account identification excludes shared owners and rejects ambiguity', () => {
++    assert.equal(ownApiKey([], [{itemType:1,itemData:{apikey:'own'}},{itemType:2,itemData:{apikey:'other'}}]), 'own');
++    assert.throws(() => ownApiKey([{familyType:2,apikey:'other'}], []));
++    assert.throws(() => ownApiKey([{familyType:1,apikey:'a'},{familyType:1,apikey:'b'}], []));
++});
++async function fixture(t, overrides={}) {
++    const app = express();
++    const server = app.listen(0, '127.0.0.1');
++    await new Promise(r=>server.once('listening',r));
++    t.after(()=>new Promise(r=>server.close(r)));
++    const origin = `http://127.0.0.1:${server.address().port}`;
++    const saved=[], exchanges=[], reports=[];
++    let logged=false;
++    app.use('/oauth',createOAuthRouter({appId:'test-id',appSecret:'test-secret',redirectUrl:`${origin}/oauth/callback`, loggedIn:()=>logged,
++        exchange:async(code,region)=>{exchanges.push({code,region});return {at:'private-token'};},
++        save:a=>{saved.push(a);logged=true;},afterLogin:async()=>{},report:e=>reports.push(e),...overrides}));
++    async function req(path, options={}) { return fetch(origin+path,{redirect:'manual',...options}); }
++    async function start() {
++        const page=await req('/oauth');
++        const cookie=page.headers.get('set-cookie').split(';')[0];
++        const state=(await page.text()).match(/name="state" value="([a-f0-9]+)"/)[1];
++        const response=await req('/oauth/start',{method:'POST',headers:{cookie,origin,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({state})});
++        assert.equal(response.status,303);
++        return {cookie,state,response};
++    }
++    return {origin,req,start,saved,exchanges,reports};
++}
++test('browser-bound OAuth flow persists once and returns without tokens in URL',async t=>{
++    const f=await fixture(t);const s=await f.start();
++    const url=new URL(s.response.headers.get('location'));
++    assert.equal(url.origin,'https://c2ccdn.coolkit.cc');
++    assert.equal(url.searchParams.get('redirectUrl'),f.origin+'/oauth/callback');
++    assert.equal(url.searchParams.get('authorization'),sign('test-secret',`test-id_${url.searchParams.get('seq')}`));
++    const path='/oauth/callback?'+new URLSearchParams({state:s.state,code:'private-code',region:'eu'});
++    const done=await f.req(path,{headers:{cookie:s.cookie}});
++    assert.equal(done.status,303);assert.equal(done.headers.get('location'),'/#/home');assert.equal(f.saved.length,1);
++    assert.equal((await f.req(path,{headers:{cookie:s.cookie}})).status,400);
++    assert.equal(f.exchanges.length,1);assert.ok(!JSON.stringify(f.reports).includes('private'));
++});
++test('forged state, missing cookie, foreign region and cross-site starts cannot exchange codes',async t=>{
++    const f=await fixture(t);const s=await f.start();
++    for(const [state,region,cookie] of [[s.state,'eu',''],['wrong','eu',s.cookie],[s.state,'evil.example',s.cookie],['é'.repeat(64),'eu',s.cookie]]) {
++        assert.equal((await f.req('/oauth/callback?'+new URLSearchParams({state,region,code:'x'}),{headers:{cookie}})).status,400);
++    }
++    assert.equal((await f.req('/oauth/start',{method:'POST',headers:{origin:'https://evil.example',cookie:s.cookie,'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({state:s.state})})).status,400);
++    assert.equal(f.exchanges.length,0);
++});
++test('exchange errors never save a session or expose upstream credentials',async t=>{
++    const f=await fixture(t,{exchange:async()=>{throw new Error('private-token');}});const s=await f.start();
++    const res=await f.req('/oauth/callback?'+new URLSearchParams({state:s.state,region:'eu',code:'x'}),{headers:{cookie:s.cookie}});
++    assert.equal(res.status,502);assert.equal(f.saved.length,0);assert.ok(!(await res.text()).includes('private-token'));
++});
++test('missing configuration disables OAuth',async t=>{
++    const f=await fixture(t,{appSecret:''});assert.equal((await f.req('/oauth')).status,503);
++    assert.deepEqual(await(await f.req('/oauth/status')).json(),{enabled:false});
++});
++test('token exchange signs exact body, validates device permission and selects own account', async () => {
++    const axios = require('../server/node_modules/axios');
++    const original = axios.create;
++    const {exchangeAccount} = require('../server/oauth/account.ts');
++    const previous = process.env.EWELINK_REQUIRED_DEVICE_ID;
++    process.env.EWELINK_REQUIRED_DEVICE_ID = '1001fe62ff';
++    let tokenBody;
++    axios.create = opts => {
++        assert.equal(opts.baseURL, 'https://eu-apia.coolkit.cc');assert.equal(opts.maxRedirects,0);
++        return {post:async(url,body,options)=>{
++            tokenBody=JSON.parse(body);assert.equal(options.headers.Authorization,`Sign ${sign('secret',body)}`);
++            return {data:{error:0,data:{accessToken:'at',refreshToken:'rt',atExpiredTime:Date.now()+86400000}}};
++        },get:async(url)=>({data:{error:0,data:url==='/v2/family'?{familyList:[{id:'home',familyType:1,apikey:'own'}]}:{thingList:[{itemType:1,itemData:{apikey:'own',deviceid:'1001fe62ff'}}]}}})};
++    };
++    try {
++        const account=await exchangeAccount('app','secret','http://localhost/oauth/callback','code','eu');
++        assert.equal(account.authMode,'oauth');assert.equal(account.user.apikey,'own');assert.equal(account.at,'at');
++        assert.equal(tokenBody.grantType,'authorization_code');
++        process.env.EWELINK_REQUIRED_DEVICE_ID='missing';
++        await assert.rejects(exchangeAccount('app','secret','http://localhost/oauth/callback','code','eu'),/Required device/);
++    } finally {axios.create=original;if(previous===undefined)delete process.env.EWELINK_REQUIRED_DEVICE_ID;else process.env.EWELINK_REQUIRED_DEVICE_ID=previous;}
++});
+diff --git a/tests/reconnect.cjs b/tests/reconnect.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/reconnect.cjs
+@@ -0,0 +1,77 @@
++const {test} = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const vm = require('node:vm');
++const path = require('node:path');
++const {EventEmitter} = require('node:events');
++const {stripTypeScriptTypes} = require('node:module');
++const root = path.join(__dirname, '..');
++const enums = require('../server/lib/coolkit-ws/dist/ts/enum.js');
++function loadTS(file, globals) {
++ let source = fs.readFileSync(path.join(root,file),'utf8').replace(/^import .*;\r?$/gm,'');
++ source=stripTypeScriptTypes(source,{mode:'strip'}).replace('export default class','module.exports = class').replace('export default new WsReconnectClass();','module.exports = new WsReconnectClass();');
++ const context={module:{exports:{}},console:{log(){},error(){}},...globals};
++ vm.runInNewContext(source,context);
++ return context.module.exports;
++}
++function sdk(compiled=false){
++ const ee=new EventEmitter(), delays=[], events=[];
++ const emit=ee.emit.bind(ee);
++ ee.emit=(name,...args)=>{if(name==='reconnect')events.push(args[0]);return emit(name,...args);};
++ const helpers={sleep:async n=>delays.push(n)};
++ let WS;
++ if(compiled){
++  const context={exports:{},console:{log(){},error(){}},clearInterval,require(name){
++   if(name.includes('tools'))return helpers;
++   if(name.includes('eventEmitter'))return ee;
++   if(name.includes('enum'))return enums;
++   return function(){};
++  }};
++  vm.runInNewContext(fs.readFileSync(path.join(root,'server/lib/coolkit-ws/dist/class/WebSocket.js'),'utf8'),context);
++  WS=context.exports.default;
++ }else WS=loadTS('server/lib/coolkit-ws/src/class/WebSocket.ts',{EE:ee,...enums,...helpers,clearInterval});
++ return {WS,delays,events};
++}
++for(const compiled of [false,true]){
++ test(`${compiled?'distributed JS':'TS source'} recovers after 99 failures`,async()=>{
++  const {WS,delays}=sdk(compiled);
++  const ws=new WS({maxRetry:99,autoReconnect:true,maxRetryInterval:600});
++  let attempts=0;
++  ws._initWs=async()=>{if(++attempts<=130){ws.wsState='CLOSED';return {error:605};} WS.isOpen=true; WS.isReconnecting=false; ws.wsState='CONNECTED'; return {error:0};};
++  await ws.reconnect();
++  assert.equal(attempts,131); assert.equal(ws.wsState,'CONNECTED');
++  assert.equal(WS.retryCount,0); assert.equal(WS.reconnectTotalTime,0);
++  assert.equal(Math.max(...delays),600000);assert.ok(delays.every(x=>x>=5000));
++ });
++ test(`${compiled?'distributed JS':'TS source'} preserves opt-out retry limit`,async()=>{
++  const {WS,events}=sdk(compiled); const ws=new WS({maxRetry:2});let attempts=0;
++  ws._initWs=async()=>{attempts++;return {error:605};};
++  await ws.reconnect();assert.equal(attempts,2);assert.ok(events.some(e=>e.error===603));
++ });
++}
++function supervisor(result){
++ let account={at:'fresh-token',user:{apikey:'same-account'}},next=0;
++ const timers=new Map(),calls=[];
++ const ws={isWsConnected:()=>false,init:async config=>{calls.push(config);if(result instanceof Error)throw result;return result;},on(){}};
++ const instance=loadTS('server/utils/wsReconnectClass.ts',{
++  CoolKitWs:ws,logger:{info(){},warn(){}},db:{getDbValue:()=>account},getEwelinkAllDeviceList(){},wsService:{listenWs(){}},syncAllWebSocketDeviceOffline(){},
++  setTimeout:(fn,ms)=>{timers.set(++next,{fn,ms});return next;},clearTimeout:id=>timers.delete(id)
++ });
++ const run=async()=>{const [id,t]=timers.entries().next().value;timers.delete(id);await t.fn();};
++ return {instance,timers,calls,run,logout:()=>account=null};
++}
++for(const result of [{error:602},{error:604},{error:605},new Error('network')])test(`startup retry ${result.error||'exception'}`,async()=>{
++ const x=supervisor(result);x.instance.startReconnect({apikey:'same-account',at:'old'});x.instance.startReconnect({apikey:'same-account'});
++ assert.equal(x.timers.size,1);await x.run();assert.equal(x.timers.size,1);assert.equal(x.calls[0].at,'fresh-token');
++});
++test('pending callback does not reconnect after logout',async()=>{const x=supervisor({error:0,msg:'success'});x.instance.startReconnect({apikey:'same-account'});x.logout();await x.run();assert.equal(x.calls.length,0);assert.equal(x.timers.size,0);});
++test('success resets backoff; permanent authentication failure is not retried',async()=>{
++ const x=supervisor({error:0,msg:'success'});x.instance.startReconnect({apikey:'same-account'});await x.run();assert.equal(x.timers.size,0);x.instance.startReconnect({apikey:'same-account'});assert.equal([...x.timers.values()][0].ms,5000);
++ const y=supervisor({error:401});y.instance.startReconnect({apikey:'same-account'});await y.run();assert.equal(y.timers.size,0);
++});
++for(const compiled of [false,true])test(`${compiled?'JS':'TS'} logout cancels recovery, including an in-flight success`,async()=>{
++ const {WS}=sdk(compiled);const ws=new WS({maxRetry:99,autoReconnect:true});let attempts=0;
++ ws._initWs=async()=>{attempts++;ws.close(true);WS.isOpen=true;return {error:0};};
++ await ws.reconnect();assert.equal(attempts,1);assert.equal(WS.isOpen,false);assert.equal(WS.isReconnecting,false);
++ await ws.reconnect();assert.equal(attempts,1);
++});
+diff --git a/tests/token-refresh.cjs b/tests/token-refresh.cjs
+new file mode 100644
+--- /dev/null
++++ b/tests/token-refresh.cjs
+@@ -0,0 +1,40 @@
++const {test}=require('node:test');
++const assert=require('node:assert/strict');
++const fs=require('node:fs');
++const vm=require('node:vm');
++const ts=require('../server/node_modules/typescript');
++function fixture(post) {
++    let account={at:'old',rt:'refresh',region:'eu',authMode:'oauth',atExpiredTime:Date.now()-1,user:{apikey:'owner'}};
++    let updated=Date.now()-16*86400000;
++    const logs=[];let inits=0;
++    const socket={connectConfig:{at:'old',apikey:'owner'}};
++    const ctx={exports:{},require(name){
++        if(name==='axios')return {post};
++        if(name.endsWith('/config'))return {coolKit:{appId:'app'}};
++        if(name.endsWith('/log'))return {info:x=>logs.push(x),warn:x=>logs.push(x)};
++        if(name.endsWith('/db'))return {getDbValue:k=>k==='eWeLinkApiInfo'?account:updated,setDbValue:(k,v)=>{if(k==='eWeLinkApiInfo')account=v;else updated=v;}};
++        if(name.endsWith('/router'))return {apiOrigin:()=> 'https://eu-apia.coolkit.cc'};
++        if(name.endsWith('/initApi'))return {initCoolkitApi:()=>inits++};
++        if(name.endsWith('/WebSocket'))return socket;
++        throw Error(name);
++    }};
++    vm.runInNewContext(ts.transpileModule(fs.readFileSync(require('node:path').join(__dirname,'../server/services/public/refreshEWeLinkToken.ts'),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true,target:ts.ScriptTarget.ES2020}}).outputText,ctx);
++    return {run:ctx.exports.default,account:()=>account,logout:()=>account=null,logs,socket,inits:()=>inits};
++}
++test('refresh updates persistent and reconnect tokens without credential logging',async()=>{
++    const f=fixture(async()=>({data:{error:0,data:{at:'new-secret',rt:'new-refresh'}}}));
++    await f.run();assert.equal(f.account().at,'new-secret');assert.equal(f.socket.connectConfig.at,'new-secret');assert.equal(f.inits(),1);
++    assert.ok(!JSON.stringify(f.logs).includes('new-secret'));
++});
++test('network outage retains session and allows later retry',async()=>{
++    let n=0;const f=fixture(async()=>{if(++n===1)throw Error('secret');return {data:{error:0,data:{at:'new',rt:'new'}}};});
++    await f.run();assert.equal(f.account().at,'old');await f.run();assert.equal(f.account().at,'new');
++});
++test('logout during refresh cannot restore the account',async()=>{
++    let finish;const f=fixture(()=>new Promise(r=>finish=r));const running=f.run();f.logout();finish({data:{error:0,data:{at:'new',rt:'new'}}});await running;
++    assert.equal(f.account(),null);assert.equal(f.inits(),0);
++});
++test('parallel refreshes are deduplicated and invalid response leaves token intact',async()=>{
++    let finish,n=0;const f=fixture(()=>{n++;return new Promise(r=>finish=r);});const running=f.run();await f.run();assert.equal(n,1);
++    finish({data:{error:401}});await running;assert.equal(f.account().at,'old');
++});
