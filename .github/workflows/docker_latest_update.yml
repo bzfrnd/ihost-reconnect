@@ -1,0 +1,312 @@
+name: Build iHost Reconnect
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ihost-reconnect
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch pinned upstream and apply fix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git init source
+          git -C source remote add origin https://github.com/eWeLinkCUBE/cc.ewelink.smart.home.addon.git
+          git -C source fetch --depth 1 origin c66a0151e70363131715cbcec69430f442fb009a
+          git -C source checkout --detach FETCH_HEAD
+
+          echo "Upstream commit:"
+          git -C source rev-parse HEAD
+
+          echo "Patch starts with:"
+          head -5 candidate.patch
+
+          echo "Normalizing upstream line endings..."
+          find source/server source/web \
+            -type f \
+            \( -name '*.ts' -o -name '*.js' -o -name '*.d.ts' -o -name '*.vue' \) \
+            -exec sed -i 's/\r$//' {} +
+
+          echo "Normalizing patch line endings..."
+          sed -i 's/\r$//' candidate.patch
+
+          cd source
+
+          echo "Checking patch..."
+          git apply \
+            --check \
+            --recount \
+            --ignore-space-change \
+            --ignore-whitespace \
+            ../candidate.patch
+
+          echo "Applying patch..."
+          git apply \
+            --recount \
+            --ignore-space-change \
+            --ignore-whitespace \
+            ../candidate.patch
+
+          echo "Patch applied successfully."
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install test dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install \
+            --prefix server \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+
+          npm install \
+            --prefix server \
+            --no-save \
+            --ignore-scripts \
+            @types/ws@7
+
+      - name: Run reconnect and OAuth tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node --test \
+            tests/reconnect.cjs \
+            tests/oauth.cjs \
+            tests/token-refresh.cjs
+
+      - name: TypeScript check
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          server/node_modules/.bin/tsc \
+            --noEmit \
+            -p server/tsconfig.json
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE=ghcr.io/${OWNER}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+          echo "Image repository:"
+          echo "ghcr.io/${OWNER}/${IMAGE_NAME}"
+
+      - name: Build ARMv7 candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          file: ./source/Dockerfile.candidate
+          platforms: linux/arm/v7
+          provenance: false
+          sbom: false
+          outputs: type=image,push=true,oci-mediatypes=false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Smoke test ARMv7 application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_CONTAINER="ihost-reconnect-smoke"
+
+          cleanup() {
+            docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          echo "Pulling exact candidate image..."
+          docker pull \
+            --platform linux/arm/v7 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+          echo
+          echo "Starting ARMv7 candidate..."
+
+          docker run -d \
+            --name "$TEST_CONTAINER" \
+            --platform linux/arm/v7 \
+            --network host \
+            -e EWELINK_APP_ID="github-smoke-test" \
+            -e EWELINK_APP_SECRET="github-smoke-test-secret" \
+            -e EWELINK_REDIRECT_URL="http://127.0.0.1:8321/oauth/callback" \
+            "${IMAGE}:${GITHUB_SHA}"
+
+          echo
+          echo "Waiting for application startup..."
+
+          PASSED=0
+          RESPONSE=""
+
+          for ATTEMPT in $(seq 1 30); do
+            if ! docker inspect \
+              --format '{{.State.Running}}' \
+              "$TEST_CONTAINER" 2>/dev/null | grep -q '^true$'; then
+
+              echo
+              echo "❌ Container stopped during startup."
+              echo
+              echo "Container logs:"
+              docker logs "$TEST_CONTAINER" || true
+              exit 1
+            fi
+
+            RESPONSE="$(curl \
+              --silent \
+              --show-error \
+              --max-time 2 \
+              http://127.0.0.1:8321/oauth/status \
+              2>/dev/null || true)"
+
+            if echo "$RESPONSE" | jq -e '.enabled == true' >/dev/null 2>&1; then
+              echo
+              echo "OAuth status response:"
+              echo "$RESPONSE"
+              echo
+              echo "✅ Application started successfully."
+              echo "✅ /oauth/status reports enabled=true."
+              PASSED=1
+              break
+            fi
+
+            echo "Attempt ${ATTEMPT}/30 - waiting..."
+            sleep 1
+          done
+
+          if [[ "$PASSED" != "1" ]]; then
+            echo
+            echo "❌ Application did not become healthy."
+            echo
+            echo "Last /oauth/status response:"
+            echo "${RESPONSE:-<no response>}"
+            echo
+            echo "Container logs:"
+            docker logs "$TEST_CONTAINER" || true
+            exit 1
+          fi
+
+          echo
+          echo "ARM architecture reported by container:"
+          docker exec "$TEST_CONTAINER" uname -m
+
+          echo
+          echo "Final container logs:"
+          docker logs "$TEST_CONTAINER" || true
+
+      - name: Promote tested image to latest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pulling tested image into local Docker store..."
+          docker pull \
+            --platform linux/arm/v7 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+          echo
+          echo "Promoting:"
+          echo "${IMAGE}:${GITHUB_SHA}"
+          echo "       ->"
+          echo "${IMAGE}:latest"
+
+          docker tag \
+            "${IMAGE}:${GITHUB_SHA}" \
+            "${IMAGE}:latest"
+
+          docker push "${IMAGE}:latest"
+
+          echo
+          echo "✅ latest updated successfully."
+
+      - name: Verify latest image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "================================================"
+          echo "LATEST IMAGE"
+          echo "================================================"
+
+          docker buildx imagetools inspect "${IMAGE}:latest"
+
+          echo
+          echo "Raw manifest:"
+          docker buildx imagetools inspect \
+            "${IMAGE}:latest" \
+            --raw
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo
+          echo "================================================"
+          echo "       iHost Reconnect update ready"
+          echo "================================================"
+          echo
+          echo "UPDATE IMAGE:"
+          echo "${IMAGE}:latest"
+          echo
+          echo "TESTED SOURCE TAG:"
+          echo "${IMAGE}:${GITHUB_SHA}"
+          echo
+          echo "ARCHITECTURE:"
+          echo "linux/arm/v7"
+          echo
+          echo "PORT:"
+          echo "8321"
+          echo
+          echo "NETWORK MODE:"
+          echo "host"
+          echo
+          echo "IMPORTANT:"
+          echo "The :latest tag was updated only after the"
+          echo "ARMv7 container started successfully and"
+          echo "/oauth/status returned enabled=true."
+          echo
+          echo "On iHost update the EXISTING :latest container."
+          echo "Do not create a new container unless necessary."
+          echo
+          echo "================================================"
