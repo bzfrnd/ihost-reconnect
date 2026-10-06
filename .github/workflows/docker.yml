@@ -35,12 +35,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+            - uses: docker/build-push-action@v6
         with:
           context: ./source
           file: ./source/Dockerfile.candidate
           platforms: linux/arm/v7
-          push: true
+          provenance: false
+          sbom: false
+          outputs: type=image,push=true,oci-mediatypes=false
           tags: |
-            ghcr.io/${{ github.repository_owner }}/ihost-reconnect:candidate
-            ghcr.io/${{ github.repository_owner }}/ihost-reconnect:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/ihost-reconnect:compat
+            ghcr.io/${{ github.repository_owner }}/ihost-reconnect:compat-${{ github.sha }}
