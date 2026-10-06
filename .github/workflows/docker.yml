@@ -129,10 +129,10 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           echo "IMAGE=ghcr.io/${OWNER}/${IMAGE_NAME}" >> "$GITHUB_ENV"
 
-          echo "Image:"
+          echo "Image repository:"
           echo "ghcr.io/${OWNER}/${IMAGE_NAME}"
 
-      - name: Build and push iHost ARMv7 image
+      - name: Build ARMv7 candidate
         uses: docker/build-push-action@v6
         with:
           context: ./source
@@ -142,89 +142,138 @@ jobs:
           sbom: false
           outputs: type=image,push=true,oci-mediatypes=false
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:compat
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      - name: Verify published ARMv7 image
+      - name: Smoke test ARMv7 application
         shell: bash
         run: |
           set -euo pipefail
 
-          echo
-          echo "================================================"
-          echo "Checking:"
-          echo "${IMAGE}:latest"
-          echo "================================================"
-          echo
+          TEST_CONTAINER="ihost-reconnect-smoke"
 
-          echo "Inspecting image configuration..."
+          cleanup() {
+            docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+          }
 
-          IMAGE_INFO="$(docker buildx imagetools inspect \
-            "${IMAGE}:latest" \
-            --format '{{json .Image}}')"
+          trap cleanup EXIT
 
-          echo "$IMAGE_INFO" | jq .
-
-          OS="$(echo "$IMAGE_INFO" | jq -r '.os')"
-          ARCH="$(echo "$IMAGE_INFO" | jq -r '.architecture')"
-
-          echo
-          echo "OS:   $OS"
-          echo "ARCH: $ARCH"
-
-          if [[ "$OS" != "linux" ]]; then
-            echo "❌ Image OS is not linux"
-            exit 1
-          fi
-
-          if [[ "$ARCH" != "arm" ]]; then
-            echo "❌ Image architecture is not ARM"
-            exit 1
-          fi
-
-          echo
-          echo "Pulling explicitly as linux/arm/v7..."
-
+          echo "Pulling exact candidate image..."
           docker pull \
             --platform linux/arm/v7 \
-            "${IMAGE}:latest"
+            "${IMAGE}:${GITHUB_SHA}"
 
           echo
-          echo "Running ARMv7 architecture test..."
+          echo "Starting ARMv7 candidate..."
 
-          MACHINE="$(docker run \
-            --rm \
+          docker run -d \
+            --name "$TEST_CONTAINER" \
             --platform linux/arm/v7 \
-            --entrypoint uname \
-            "${IMAGE}:latest" \
-            -m)"
+            --network host \
+            -e EWELINK_APP_ID="github-smoke-test" \
+            -e EWELINK_APP_SECRET="github-smoke-test-secret" \
+            -e EWELINK_REDIRECT_URL="http://127.0.0.1:8322/oauth/callback" \
+            "${IMAGE}:${GITHUB_SHA}"
 
-          echo "Container reports: $MACHINE"
+          echo
+          echo "Waiting for application startup..."
 
-          case "$MACHINE" in
-            armv7*|armhf*)
+          PASSED=0
+          RESPONSE=""
+
+          for ATTEMPT in $(seq 1 30); do
+            if ! docker inspect \
+              --format '{{.State.Running}}' \
+              "$TEST_CONTAINER" 2>/dev/null | grep -q '^true$'; then
+
               echo
-              echo "✅ Verified linux/arm/v7 image"
-              ;;
-            *)
+              echo "❌ Container stopped during startup."
               echo
-              echo "❌ Expected ARMv7 but container reports: $MACHINE"
+              echo "Container logs:"
+              docker logs "$TEST_CONTAINER" || true
               exit 1
-              ;;
-          esac
+            fi
 
-      - name: Inspect raw Docker manifest
+            RESPONSE="$(curl \
+              --silent \
+              --show-error \
+              --max-time 2 \
+              http://127.0.0.1:8322/oauth/status \
+              2>/dev/null || true)"
+
+            if echo "$RESPONSE" | jq -e '.enabled == true' >/dev/null 2>&1; then
+              echo
+              echo "OAuth status response:"
+              echo "$RESPONSE"
+              echo
+              echo "✅ Application started successfully."
+              echo "✅ /oauth/status reports enabled=true."
+              PASSED=1
+              break
+            fi
+
+            echo "Attempt ${ATTEMPT}/30 - waiting..."
+            sleep 1
+          done
+
+          if [[ "$PASSED" != "1" ]]; then
+            echo
+            echo "❌ Application did not become healthy."
+            echo
+            echo "Last /oauth/status response:"
+            echo "${RESPONSE:-<no response>}"
+            echo
+            echo "Container logs:"
+            docker logs "$TEST_CONTAINER" || true
+            exit 1
+          fi
+
+          echo
+          echo "ARM architecture reported by container:"
+          docker exec "$TEST_CONTAINER" uname -m
+
+          echo
+          echo "Final container logs:"
+          docker logs "$TEST_CONTAINER" || true
+
+      - name: Promote tested image to latest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Pulling tested image into local Docker store..."
+          docker pull \
+            --platform linux/arm/v7 \
+            "${IMAGE}:${GITHUB_SHA}"
+
+          echo
+          echo "Promoting:"
+          echo "${IMAGE}:${GITHUB_SHA}"
+          echo "       ->"
+          echo "${IMAGE}:latest"
+
+          docker tag \
+            "${IMAGE}:${GITHUB_SHA}" \
+            "${IMAGE}:latest"
+
+          docker push "${IMAGE}:latest"
+
+          echo
+          echo "✅ latest updated successfully."
+
+      - name: Verify latest image
         shell: bash
         run: |
           set -euo pipefail
 
           echo
           echo "================================================"
-          echo "RAW IMAGE MANIFEST"
+          echo "LATEST IMAGE"
           echo "================================================"
-          echo
 
+          docker buildx imagetools inspect "${IMAGE}:latest"
+
+          echo
+          echo "Raw manifest:"
           docker buildx imagetools inspect \
             "${IMAGE}:latest" \
             --raw
@@ -234,24 +283,30 @@ jobs:
         run: |
           echo
           echo "================================================"
-          echo "       iHost Reconnect image ready"
+          echo "       iHost Reconnect update ready"
           echo "================================================"
           echo
-          echo "IMAGE:"
+          echo "UPDATE IMAGE:"
           echo "${IMAGE}:latest"
+          echo
+          echo "TESTED SOURCE TAG:"
+          echo "${IMAGE}:${GITHUB_SHA}"
           echo
           echo "ARCHITECTURE:"
           echo "linux/arm/v7"
           echo
           echo "PORT:"
-          echo "8321"
+          echo "8322"
           echo
           echo "NETWORK MODE:"
           echo "host"
           echo
-          echo "TAGS:"
-          echo "${IMAGE}:latest"
-          echo "${IMAGE}:compat"
-          echo "${IMAGE}:${GITHUB_SHA}"
+          echo "IMPORTANT:"
+          echo "The :latest tag was updated only after the"
+          echo "ARMv7 container started successfully and"
+          echo "/oauth/status returned enabled=true."
+          echo
+          echo "On iHost update the EXISTING :latest container."
+          echo "Do not create a new container unless necessary."
           echo
           echo "================================================"
