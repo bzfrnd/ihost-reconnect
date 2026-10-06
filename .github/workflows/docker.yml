@@ -146,7 +146,7 @@ jobs:
             ${{ env.IMAGE }}:compat
             ${{ env.IMAGE }}:${{ github.sha }}
 
-      - name: Verify published image
+      - name: Verify published ARMv7 image
         shell: bash
         run: |
           set -euo pipefail
@@ -158,21 +158,72 @@ jobs:
           echo "================================================"
           echo
 
-          docker buildx imagetools inspect "${IMAGE}:latest"
+          echo "Inspecting image configuration..."
 
-          INSPECT="$(docker buildx imagetools inspect "${IMAGE}:latest")"
+          IMAGE_INFO="$(docker buildx imagetools inspect \
+            "${IMAGE}:latest" \
+            --format '{{json .Image}}')"
 
-          if echo "$INSPECT" | grep -q "linux/arm/v7"; then
-            echo "✅ linux/arm/v7 found"
-          else
-            echo "❌ linux/arm/v7 was not found in the published image."
+          echo "$IMAGE_INFO" | jq .
+
+          OS="$(echo "$IMAGE_INFO" | jq -r '.os')"
+          ARCH="$(echo "$IMAGE_INFO" | jq -r '.architecture')"
+
+          echo
+          echo "OS:   $OS"
+          echo "ARCH: $ARCH"
+
+          if [[ "$OS" != "linux" ]]; then
+            echo "❌ Image OS is not linux"
             exit 1
           fi
+
+          if [[ "$ARCH" != "arm" ]]; then
+            echo "❌ Image architecture is not ARM"
+            exit 1
+          fi
+
+          echo
+          echo "Pulling explicitly as linux/arm/v7..."
+
+          docker pull \
+            --platform linux/arm/v7 \
+            "${IMAGE}:latest"
+
+          echo
+          echo "Running ARMv7 architecture test..."
+
+          MACHINE="$(docker run \
+            --rm \
+            --platform linux/arm/v7 \
+            --entrypoint uname \
+            "${IMAGE}:latest" \
+            -m)"
+
+          echo "Container reports: $MACHINE"
+
+          case "$MACHINE" in
+            armv7*|armhf*)
+              echo
+              echo "✅ Verified linux/arm/v7 image"
+              ;;
+            *)
+              echo
+              echo "❌ Expected ARMv7 but container reports: $MACHINE"
+              exit 1
+              ;;
+          esac
 
       - name: Inspect raw Docker manifest
         shell: bash
         run: |
           set -euo pipefail
+
+          echo
+          echo "================================================"
+          echo "RAW IMAGE MANIFEST"
+          echo "================================================"
+          echo
 
           docker buildx imagetools inspect \
             "${IMAGE}:latest" \
@@ -197,5 +248,10 @@ jobs:
           echo
           echo "NETWORK MODE:"
           echo "host"
+          echo
+          echo "TAGS:"
+          echo "${IMAGE}:latest"
+          echo "${IMAGE}:compat"
+          echo "${IMAGE}:${GITHUB_SHA}"
           echo
           echo "================================================"
