@@ -28,19 +28,37 @@ jobs:
           git -C source fetch --depth 1 origin c66a0151e70363131715cbcec69430f442fb009a
           git -C source checkout --detach FETCH_HEAD
 
-          cd source
-
           echo "Upstream commit:"
-          git rev-parse HEAD
+          git -C source rev-parse HEAD
 
           echo "Patch starts with:"
-          head -5 ../candidate.patch
+          head -5 candidate.patch
+
+          echo "Normalizing upstream line endings..."
+          find source/server source/web \
+            -type f \
+            \( -name '*.ts' -o -name '*.js' -o -name '*.d.ts' -o -name '*.vue' \) \
+            -exec sed -i 's/\r$//' {} +
+
+          echo "Normalizing patch line endings..."
+          sed -i 's/\r$//' candidate.patch
+
+          cd source
 
           echo "Checking patch..."
-          git apply --check --recount ../candidate.patch || true
+          git apply \
+            --check \
+            --recount \
+            --ignore-space-change \
+            --ignore-whitespace \
+            ../candidate.patch
 
-          echo "Applying patch using 3-way merge..."
-          git apply --recount --3way ../candidate.patch
+          echo "Applying patch..."
+          git apply \
+            --recount \
+            --ignore-space-change \
+            --ignore-whitespace \
+            ../candidate.patch
 
           echo "Patch applied successfully."
 
