@@ -7,6 +7,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE_NAME: ihost-reconnect
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,7 +19,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Fetch pinned upstream and apply fix
+        shell: bash
         run: |
+          set -euo pipefail
+
           git init source
           git -C source remote add origin https://github.com/eWeLinkCUBE/cc.ewelink.smart.home.addon.git
           git -C source fetch --depth 1 origin c66a0151e70363131715cbcec69430f442fb009a
@@ -24,24 +30,59 @@ jobs:
 
           cd source
 
-          git apply --check ../candidate.patch
-          git apply ../candidate.patch
+          echo "Upstream commit:"
+          git rev-parse HEAD
+
+          echo "Patch starts with:"
+          head -5 ../candidate.patch
+
+          echo "Checking patch..."
+          git apply --check --recount ../candidate.patch || true
+
+          echo "Applying patch using 3-way merge..."
+          git apply --recount --3way ../candidate.patch
+
+          echo "Patch applied successfully."
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24"
 
-      - name: Test candidate
+      - name: Install test dependencies
         working-directory: source
+        shell: bash
         run: |
-          npm install --prefix server --ignore-scripts --no-audit --no-fund
-          npm install --prefix server --no-save --ignore-scripts @types/ws@7
+          set -euo pipefail
+
+          npm install \
+            --prefix server \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+
+          npm install \
+            --prefix server \
+            --no-save \
+            --ignore-scripts \
+            @types/ws@7
+
+      - name: Run reconnect and OAuth tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
 
           node --test \
             tests/reconnect.cjs \
             tests/oauth.cjs \
             tests/token-refresh.cjs
+
+      - name: TypeScript check
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
 
           server/node_modules/.bin/tsc \
             --noEmit \
@@ -55,7 +96,7 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -63,37 +104,80 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set image name
+        shell: bash
         run: |
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ihost-reconnect" >> "$GITHUB_ENV"
+          set -euo pipefail
+
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE=ghcr.io/${OWNER}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+          echo "Image:"
+          echo "ghcr.io/${OWNER}/${IMAGE_NAME}"
 
       - name: Build and push iHost ARMv7 image
         uses: docker/build-push-action@v6
         with:
           context: ./source
           file: ./source/Dockerfile.candidate
-
           platforms: linux/arm/v7
-
           provenance: false
           sbom: false
-
           outputs: type=image,push=true,oci-mediatypes=false
-
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:compat
-            ${{ env.IMAGE }}:compat-${{ github.sha }}
+            ${{ env.IMAGE }}:${{ github.sha }}
 
       - name: Verify published image
+        shell: bash
         run: |
-          echo "Checking image:"
-          echo "$IMAGE:latest"
+          set -euo pipefail
 
-          docker buildx imagetools inspect "$IMAGE:latest"
+          echo
+          echo "================================================"
+          echo "Checking:"
+          echo "${IMAGE}:latest"
+          echo "================================================"
+          echo
 
-          if docker buildx imagetools inspect "$IMAGE:latest" | grep -q "linux/arm/v7"; then
-            echo "OK: image contains linux/arm/v7"
+          docker buildx imagetools inspect "${IMAGE}:latest"
+
+          INSPECT="$(docker buildx imagetools inspect "${IMAGE}:latest")"
+
+          if echo "$INSPECT" | grep -q "linux/arm/v7"; then
+            echo "✅ linux/arm/v7 found"
           else
-            echo "ERROR: linux/arm/v7 image not found"
+            echo "❌ linux/arm/v7 was not found in the published image."
             exit 1
           fi
+
+      - name: Inspect raw Docker manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect \
+            "${IMAGE}:latest" \
+            --raw
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo
+          echo "================================================"
+          echo "       iHost Reconnect image ready"
+          echo "================================================"
+          echo
+          echo "IMAGE:"
+          echo "${IMAGE}:latest"
+          echo
+          echo "ARCHITECTURE:"
+          echo "linux/arm/v7"
+          echo
+          echo "PORT:"
+          echo "8321"
+          echo
+          echo "NETWORK MODE:"
+          echo "host"
+          echo
+          echo "================================================"
