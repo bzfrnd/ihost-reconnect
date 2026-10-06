@@ -558,10 +558,11 @@ diff --git a/.dockerignore b/.dockerignore
 new file mode 100644
 --- /dev/null
 +++ b/.dockerignore
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +.git
 +**/node_modules
-+**/dist
++server/dist
++web/dist
 +**/.env
 +**/.env.*
 +!**/.env.example
