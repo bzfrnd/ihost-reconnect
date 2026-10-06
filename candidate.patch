@@ -779,7 +779,7 @@ new file mode 100644
 +    const cookieOptions = { httpOnly: true, sameSite: 'lax' as const, secure: callback?.protocol === 'https:', path: '/oauth' };
 +    const page = (body: string) => `<!doctype html><html lang="hu"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>iHost – eWeLink</title><body><h1>eWeLink-belépés</h1>${body}</body></html>`;
 +    router.use((_req, res, next) => {
-+        res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
++        res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
 +        next();
 +    });
 +    router.get('/status', (_req, res) => { res.json({ enabled }); });
